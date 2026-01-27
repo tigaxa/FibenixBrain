@@ -1,0 +1,11 @@
+services:
+  trendline:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - ./data:/data
+    entrypoint: ["bash", "-lc"]
+    command: ["sleep infinity"]
+    environment:
+      PYTHONUNBUFFERED: "1"
