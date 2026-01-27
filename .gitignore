@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Outputs
+/data/*.csv
+!/data/sample.csv
+/data/*.xlsx
+/data/*.parquet
+/data/*.json
+
+# Logs
+*.log
