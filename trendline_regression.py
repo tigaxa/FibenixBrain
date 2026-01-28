@@ -19,6 +19,7 @@ from common import (
     parse_rows,
     pip_size_for_symbol,
 )
+
 @dataclass
 class EnvSnapshot:
     trend_dir: int
@@ -29,6 +30,9 @@ class EnvSnapshot:
     t1: int
     p0: float
     p1: float
+    # 追加: チャネルライン（トレンドラインの対になるライン）の座標
+    ch_p0: float
+    ch_p1: float
 
 
 @dataclass
@@ -52,8 +56,6 @@ def line_at(snapshot: EnvSnapshot, t: int) -> float:
 def find_swings(
     rows: List[Tuple[int, float, float, float, float]], depth: int
 ) -> Tuple[List[SwingPoint], List[SwingPoint]]:
-    # depth 本分の前後で高値/安値が最大/最小ならスイングとして記録する。
-    # ※終端付近は判定不能なので除外される。
     highs: List[SwingPoint] = []
     lows: List[SwingPoint] = []
     if depth < 1 or len(rows) < (2 * depth + 1):
@@ -75,17 +77,18 @@ def find_last_breakout(
     snapshot: EnvSnapshot,
     buffer_price: float,
 ) -> BreakoutInfo | None:
-    # 現在のトレンドラインからの「終値のブレイク」を直近から逆順で探索。
-    # 上昇トレンドは下抜け、下降トレンドは上抜けをブレイクとする。
+    # 現在のトレンドライン（上昇なら下限、下降なら上限）からのブレイクを判定
     if snapshot.trend_dir == 0:
         return None
     for i in range(len(times) - 1, 0, -1):
         line_i = line_at(snapshot, times[i])
         line_prev = line_at(snapshot, times[i - 1])
         if snapshot.trend_dir < 0:
+            # 下降トレンド：上限ライン(Resistance)を上に抜けたらブレイク
             if closes[i] > line_i + buffer_price and closes[i - 1] <= line_prev + buffer_price:
                 return BreakoutInfo(index=i, time=times[i], direction=1)
         elif snapshot.trend_dir > 0:
+            # 上昇トレンド：下限ライン(Support)を下に抜けたらブレイク
             if closes[i] < line_i - buffer_price and closes[i - 1] >= line_prev - buffer_price:
                 return BreakoutInfo(index=i, time=times[i], direction=-1)
     return None
@@ -103,8 +106,6 @@ def compute_trade_signal(
     max_retrace_bars: int,
     swing_depth: int,
 ) -> dict | None:
-    # H4のトレンドラインブレイク後のフィボ戻しエントリーを組み立てる。
-    # D1のブレイク方向一致 + W1/MNの逆行トレンド回避を前提条件にする。
     if not rows_h4 or snap_h4.trend_dir == 0:
         return None
     times, _highs, _lows, closes = extract_series(rows_h4)
@@ -113,7 +114,7 @@ def compute_trade_signal(
     if not breakout:
         return None
 
-    # D1のブレイク確認。H4のブレイク方向と一致しない場合は無視。
+    # D1のブレイク確認
     d1_breakout_long = False
     d1_breakout_short = False
     if snap_d1:
@@ -126,7 +127,7 @@ def compute_trade_signal(
     if breakout.direction < 0 and not d1_breakout_short:
         return None
 
-    # 週足/月足が逆方向トレンドならエントリーを禁止。
+    # 週足/月足フィルター
     if snap_w1 and snap_w1.trend_dir == -1 and breakout.direction > 0:
         return None
     if snap_w1 and snap_w1.trend_dir == 1 and breakout.direction < 0:
@@ -139,13 +140,11 @@ def compute_trade_signal(
     highs, lows = find_swings(rows_h4, swing_depth)
     start = None
     if breakout.direction > 0:
-        # ロング: ブレイク前の直近安値を波の起点とする。
         for sp in reversed(lows):
             if sp.index < breakout.index:
                 start = sp
                 break
     else:
-        # ショート: ブレイク前の直近高値を波の起点とする。
         for sp in reversed(highs):
             if sp.index < breakout.index:
                 start = sp
@@ -155,13 +154,11 @@ def compute_trade_signal(
 
     wave_end = None
     if breakout.direction > 0:
-        # ロング: ブレイク後の最初の高値が波の終点。
         for sp in highs:
             if sp.index > breakout.index:
                 wave_end = sp
                 break
     else:
-        # ショート: ブレイク後の最初の安値が波の終点。
         for sp in lows:
             if sp.index > breakout.index:
                 wave_end = sp
@@ -176,13 +173,11 @@ def compute_trade_signal(
     bars_since_breakout = (len(rows_h4) - 1) - breakout.index
     if bars_since_breakout > max_retrace_bars:
         return None
-    # ブレイク直後は 0.618 戻し、時間経過で 0.382 戻しに切り替える。
     level = 0.618 if bars_since_breakout <= fast_retrace_bars else 0.382
 
     current_price = closes[-1]
     stop_edge = 5 * pip_size
     if breakout.direction > 0:
-        # ロング: 直近安値を下抜けたら無効。価格が戻り切っていない場合のみ指値。
         if current_price <= start.price - stop_edge:
             return None
         entry_price = wave_end.price - wave_size * level
@@ -191,7 +186,6 @@ def compute_trade_signal(
         sl_price = wave_end.price - wave_size * (0.309 if level > 0.5 else 0.118)
         tp_price = wave_end.price + wave_size * 0.618
     else:
-        # ショート: 直近高値を上抜けたら無効。価格が戻り切っていない場合のみ指値。
         if current_price >= start.price + stop_edge:
             return None
         entry_price = wave_end.price + wave_size * level
@@ -213,8 +207,6 @@ def compute_trade_signal(
 
 def assess_timeframe(rows: List[Tuple[int, float, float, float, float]], lookback: int,
                      min_slope_pips: float, pip_size: float) -> EnvSnapshot | None:
-    # 高値/安値それぞれで線形回帰し、同方向の傾きならトレンドと判定。
-    # 傾きは pips / bar を秒スケールへ換算して閾値評価する。
     if not rows:
         return None
     if lookback > 0 and len(rows) > lookback:
@@ -227,33 +219,61 @@ def assess_timeframe(rows: List[Tuple[int, float, float, float, float]], lookbac
     xs = [t - t0 for t in times]
     slope_high, intercept_high = linear_regression(xs, highs)
     slope_low, intercept_low = linear_regression(xs, lows)
-    # スロープ閾値は「pips / bar」を秒換算する。
+    
     diffs = [times[i] - times[i - 1] for i in range(1, len(times))]
     bar_sec = median(diffs)
     min_slope = 0.0
     if min_slope_pips > 0 and bar_sec > 0:
         min_slope = (min_slope_pips * pip_size) / float(bar_sec)
+    
     trend_dir = 0
     if slope_high > min_slope and slope_low > min_slope:
         trend_dir = 1
     elif slope_high < -min_slope and slope_low < -min_slope:
         trend_dir = -1
+    
+    # ----------------------------------------------------
+    # トレンドラインとチャネルラインの選定
+    # ----------------------------------------------------
+    slope = 0.0
+    intercept = 0.0
+    ch_slope = 0.0
+    ch_intercept = 0.0
+
     if trend_dir > 0:
-        # 上昇時は安値回帰線を基準ラインとして使う。
+        # 上昇トレンド
+        # トレンドライン（主） = 安値（下側）
+        # チャネルライン（対） = 高値（上側）
         slope = slope_low
         intercept = intercept_low
+        ch_slope = slope_high
+        ch_intercept = intercept_high
     elif trend_dir < 0:
-        # 下降時は高値回帰線を基準ラインとして使う。
+        # 下降トレンド
+        # トレンドライン（主） = 高値（上側）
+        # チャネルライン（対） = 安値（下側）
         slope = slope_high
         intercept = intercept_high
+        ch_slope = slope_low
+        ch_intercept = intercept_low
     else:
-        # レンジ扱いは高値/安値の平均線。
+        # レンジ：主ラインは平均、チャネルは高値（便宜上）
         slope = (slope_high + slope_low) / 2.0
         intercept = (intercept_high + intercept_low) / 2.0
+        ch_slope = slope_high
+        ch_intercept = intercept_high
+
     t_last = times[-1]
     line_now = intercept + slope * float(t_last - t0)
+    
+    # 主トレンドライン座標
     p0 = intercept
     p1 = intercept + slope * float(t1 - t0)
+    
+    # チャネルライン座標
+    ch_p0 = ch_intercept
+    ch_p1 = ch_intercept + ch_slope * float(t1 - t0)
+
     return EnvSnapshot(
         trend_dir=trend_dir,
         slope=slope,
@@ -263,11 +283,12 @@ def assess_timeframe(rows: List[Tuple[int, float, float, float, float]], lookbac
         t1=t1,
         p0=p0,
         p1=p1,
+        ch_p0=ch_p0,
+        ch_p1=ch_p1,
     )
 
 
 def run_env_mode(args: argparse.Namespace) -> int:
-    # 複数時間足のスナップショットを集計し、環境CSV/ラインCSV/注文CSVを生成。
     if not args.env_dir or not args.symbols:
         print("env mode requires --env-dir and --symbols", file=sys.stderr)
         return 2
@@ -306,7 +327,6 @@ def run_env_mode(args: argparse.Namespace) -> int:
             if d1.trend_dir > 0 and d1.last_close < d1.line_now - buffer_price:
                 d1_breakout_short = True
 
-        # D1のブレイク方向を基準にロング/ショート許可を決め、W1/MNで逆行を除外。
         allow_long = bool(d1_breakout_long)
         allow_short = bool(d1_breakout_short)
         if w1 and w1.trend_dir == -1:
@@ -358,6 +378,8 @@ def run_env_mode(args: argparse.Namespace) -> int:
                 breakout_long,
                 breakout_short,
                 breakout_line,
+                f"{snap.ch_p0:.6f}", # チャネルライン始点
+                f"{snap.ch_p1:.6f}", # チャネルライン終点
             ])
 
         if args.out_orders and h4:
@@ -422,6 +444,7 @@ def run_env_mode(args: argparse.Namespace) -> int:
                 "symbol", "tf", "t1", "p1", "t2", "p2",
                 "trend_dir", "line_now", "last_close",
                 "breakout_long", "breakout_short", "breakout_line",
+                "ch_p1", "ch_p2",
             ])
             writer.writerows(line_rows)
     if args.out_orders:
