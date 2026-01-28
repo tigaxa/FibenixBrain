@@ -333,14 +333,18 @@ def run_env_mode(args: argparse.Namespace) -> int:
     for symbol in symbols:
         pip = pip_size_for_symbol(symbol)
         tf_snap: dict[str, EnvSnapshot] = {}
+        tf_rows: dict[str, List] = {}
+
         for tf in timeframes:
             path = env_dir / f"{args.file_prefix}{symbol}_{tf}.csv"
             if not path.exists():
                 continue
             rows = load_ohlc_rows(str(path))
+            tf_rows[tf] = rows
             snap = assess_timeframe(rows, args.lookback, args.min_slope_pips, pip)
             if snap:
                 tf_snap[tf] = snap
+        
         h4 = tf_snap.get("H4")
         d1 = tf_snap.get("D1")
         w1 = tf_snap.get("W1")
@@ -393,28 +397,84 @@ def run_env_mode(args: argparse.Namespace) -> int:
                     breakout_line = f"{snap.line_now + (args.breakout_buffer_pips * pip):.6f}"
                 elif snap.trend_dir > 0:
                     breakout_line = f"{snap.line_now - (args.breakout_buffer_pips * pip):.6f}"
+            
+            bo_time = ""
+            bo_price = ""
+            bo_dir = "0"
+            
+            # 波の終点（Wave End）用の変数
+            we_time = ""
+            we_price = ""
+            
+            if tf in tf_rows:
+                rows = tf_rows[tf]
+                if args.lookback > 0 and len(rows) > args.lookback:
+                    rows = rows[-args.lookback:]
+                times, _, _, closes = extract_series(rows)
+                buffer_p = args.breakout_buffer_pips * pip
+                bo = find_last_breakout(times, closes, snap, buffer_p)
+                if bo:
+                    bo_time = str(bo.time)
+                    price_at = line_at(snap, bo.time)
+                    bo_price = f"{price_at:.6f}"
+                    bo_dir = str(bo.direction)
+                    
+                    # ----------------------------------------------------
+                    # 波の終点（到達点）の探索
+                    # ブレイクアウト時点(bo.index)から現在までの足(rows)を探索
+                    # ----------------------------------------------------
+                    # rowsはスライス済みなので、bo.indexはそのスライス内でのインデックス
+                    search_slice = rows[bo.index:] 
+                    if bo.direction > 0:
+                        # 上昇ブレイク: 最高値を探す
+                        max_h = -1.0
+                        max_t = 0
+                        for r in search_slice:
+                            # r = (time, open, high, low, close)
+                            if r[2] > max_h:
+                                max_h = r[2]
+                                max_t = r[0]
+                        if max_t > 0:
+                            we_time = str(max_t)
+                            we_price = f"{max_h:.6f}"
+                    elif bo.direction < 0:
+                        # 下降ブレイク: 最安値を探す
+                        min_l = 1e20
+                        min_t = 0
+                        for r in search_slice:
+                            if r[3] < min_l:
+                                min_l = r[3]
+                                min_t = r[0]
+                        if min_t > 0:
+                            we_time = str(min_t)
+                            we_price = f"{min_l:.6f}"
+
             line_rows.append([
                 symbol,
                 tf,
                 str(snap.t0),
-                f"{snap.p0:.6f}", # Breakout Line Start (Trend Line)
+                f"{snap.p0:.6f}",
                 str(snap.t1),
-                f"{snap.p1:.6f}", # Breakout Line End
+                f"{snap.p1:.6f}",
                 str(snap.trend_dir),
                 f"{snap.line_now:.6f}",
                 f"{snap.last_close:.6f}",
                 breakout_long,
                 breakout_short,
                 breakout_line,
-                f"{snap.top_p0:.6f}", # Top Channel Start
-                f"{snap.top_p1:.6f}", # Top Channel End
-                f"{snap.btm_p0:.6f}", # Bottom Channel Start
-                f"{snap.btm_p1:.6f}", # Bottom Channel End
+                f"{snap.top_p0:.6f}",
+                f"{snap.top_p1:.6f}",
+                f"{snap.btm_p0:.6f}",
+                f"{snap.btm_p1:.6f}",
+                bo_time,
+                bo_price,
+                bo_dir,
+                we_time,  # 追加: 波の終点時刻
+                we_price  # 追加: 波の終点価格
             ])
 
         if args.out_orders and h4:
-            path_h4 = env_dir / f"{args.file_prefix}{symbol}_H4.csv"
-            rows_h4 = load_ohlc_rows(str(path_h4)) if path_h4.exists() else []
+            rows_h4 = tf_rows.get("H4", [])
             if args.lookback > 0 and len(rows_h4) > args.lookback:
                 rows_h4 = rows_h4[-args.lookback:]
             signal = compute_trade_signal(
@@ -474,7 +534,9 @@ def run_env_mode(args: argparse.Namespace) -> int:
                 "symbol", "tf", "t1", "p1", "t2", "p2",
                 "trend_dir", "line_now", "last_close",
                 "breakout_long", "breakout_short", "breakout_line",
-                "top_p0", "top_p1", "btm_p0", "btm_p1" # Header Updated
+                "top_p0", "top_p1", "btm_p0", "btm_p1",
+                "bo_time", "bo_price", "bo_dir",
+                "we_time", "we_price" # ヘッダー追加
             ])
             writer.writerows(line_rows)
     if args.out_orders:
@@ -556,7 +618,6 @@ def main() -> int:
         return 2
 
     return run_regression_mode(args)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
