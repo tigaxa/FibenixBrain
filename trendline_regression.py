@@ -28,11 +28,14 @@ class EnvSnapshot:
     last_close: float
     t0: int
     t1: int
+    # 7本ライン生成用：チャネル全体の「上限」と「下限」の座標
+    top_p0: float
+    top_p1: float
+    btm_p0: float
+    btm_p1: float
+    # ブレイクアウト判定用の基準ライン（Trend Line）
     p0: float
     p1: float
-    # 追加: チャネルライン（トレンドラインの対になるライン）の座標
-    ch_p0: float
-    ch_p1: float
 
 
 @dataclass
@@ -50,6 +53,7 @@ class BreakoutInfo:
 
 
 def line_at(snapshot: EnvSnapshot, t: int) -> float:
+    # ブレイクアウト判定には p0, p1 (トレンド側のライン) を使用
     return snapshot.p0 + snapshot.slope * float(t - snapshot.t0)
 
 
@@ -77,7 +81,6 @@ def find_last_breakout(
     snapshot: EnvSnapshot,
     buffer_price: float,
 ) -> BreakoutInfo | None:
-    # 現在のトレンドライン（上昇なら下限、下降なら上限）からのブレイクを判定
     if snapshot.trend_dir == 0:
         return None
     for i in range(len(times) - 1, 0, -1):
@@ -114,7 +117,6 @@ def compute_trade_signal(
     if not breakout:
         return None
 
-    # D1のブレイク確認
     d1_breakout_long = False
     d1_breakout_short = False
     if snap_d1:
@@ -127,7 +129,6 @@ def compute_trade_signal(
     if breakout.direction < 0 and not d1_breakout_short:
         return None
 
-    # 週足/月足フィルター
     if snap_w1 and snap_w1.trend_dir == -1 and breakout.direction > 0:
         return None
     if snap_w1 and snap_w1.trend_dir == 1 and breakout.direction < 0:
@@ -232,47 +233,72 @@ def assess_timeframe(rows: List[Tuple[int, float, float, float, float]], lookbac
     elif slope_high < -min_slope and slope_low < -min_slope:
         trend_dir = -1
     
-    # ----------------------------------------------------
-    # トレンドラインとチャネルラインの選定
-    # ----------------------------------------------------
+    # ----------------------------------------------------------------
+    # 7本ライン（チャネル）の計算ロジック
+    # 1. トレンド方向に基づいて「基準となる傾き」を決める
+    # 2. その傾きを使って、期間内の全高値・全安値をスキャンし、
+    #    全てを包み込む「最大切片(Top)」と「最小切片(Bottom)」を算出する
+    # ----------------------------------------------------------------
     slope = 0.0
-    intercept = 0.0
-    ch_slope = 0.0
-    ch_intercept = 0.0
-
+    
     if trend_dir > 0:
-        # 上昇トレンド
-        # トレンドライン（主） = 安値（下側）
-        # チャネルライン（対） = 高値（上側）
+        # 上昇トレンド：安値の傾きを基準にする（サポート重視）
         slope = slope_low
-        intercept = intercept_low
-        ch_slope = slope_high
-        ch_intercept = intercept_high
     elif trend_dir < 0:
-        # 下降トレンド
-        # トレンドライン（主） = 高値（上側）
-        # チャネルライン（対） = 安値（下側）
+        # 下降トレンド：高値の傾きを基準にする（レジスタンス重視）
         slope = slope_high
-        intercept = intercept_high
-        ch_slope = slope_low
-        ch_intercept = intercept_low
     else:
-        # レンジ：主ラインは平均、チャネルは高値（便宜上）
+        # レンジ：平均傾き
         slope = (slope_high + slope_low) / 2.0
-        intercept = (intercept_high + intercept_low) / 2.0
-        ch_slope = slope_high
-        ch_intercept = intercept_high
 
+    # 切片のスキャン (y = mx + c  =>  c = y - mx)
+    # 期間内のすべての足において、基準の傾き線を引いた場合の切片を計算し、最大値・最小値を得る
+    c_max = -1e20
+    c_min = 1e20
+    
+    for i in range(len(times)):
+        x_i = float(times[i] - t0)
+        # 高値に対する切片
+        c_h = highs[i] - slope * x_i
+        # 安値に対する切片
+        c_l = lows[i] - slope * x_i
+        
+        if c_h > c_max:
+            c_max = c_h
+        if c_l < c_min:
+            c_min = c_l
+    
+    # Top Line (チャネル上限)
+    top_p0 = c_max
+    top_p1 = c_max + slope * float(t1 - t0)
+    
+    # Bottom Line (チャネル下限)
+    btm_p0 = c_min
+    btm_p1 = c_min + slope * float(t1 - t0)
+
+    # ----------------------------------------------------------------
+    # ブレイクアウト判定用の「トレンドライン」の定義
+    # 上昇トレンドなら下限線、下降トレンドなら上限線をブレイク基準とする
+    # ----------------------------------------------------------------
+    p0 = 0.0
+    p1 = 0.0
+    
+    if trend_dir > 0:
+        # 上昇：下限ブレイクを監視
+        p0 = btm_p0
+        p1 = btm_p1
+    elif trend_dir < 0:
+        # 下降：上限ブレイクを監視
+        p0 = top_p0
+        p1 = top_p1
+    else:
+        # レンジ：中間にしておく（判定には使われない）
+        p0 = (top_p0 + btm_p0) / 2.0
+        p1 = (top_p1 + btm_p1) / 2.0
+    
     t_last = times[-1]
-    line_now = intercept + slope * float(t_last - t0)
-    
-    # 主トレンドライン座標
-    p0 = intercept
-    p1 = intercept + slope * float(t1 - t0)
-    
-    # チャネルライン座標
-    ch_p0 = ch_intercept
-    ch_p1 = ch_intercept + ch_slope * float(t1 - t0)
+    # トレンドライン上の現在価格（ブレイク判定用）
+    line_now = p0 + slope * float(t_last - t0)
 
     return EnvSnapshot(
         trend_dir=trend_dir,
@@ -281,10 +307,12 @@ def assess_timeframe(rows: List[Tuple[int, float, float, float, float]], lookbac
         last_close=closes[-1],
         t0=t0,
         t1=t1,
-        p0=p0,
-        p1=p1,
-        ch_p0=ch_p0,
-        ch_p1=ch_p1,
+        p0=p0, # ブレイクアウト判定用（Trend Line）始点
+        p1=p1, # ブレイクアウト判定用（Trend Line）終点
+        top_p0=top_p0, # チャネル全体の上限始点
+        top_p1=top_p1, # チャネル全体の上限終点
+        btm_p0=btm_p0, # チャネル全体の下限始点
+        btm_p1=btm_p1  # チャネル全体の下限終点
     )
 
 
@@ -369,17 +397,19 @@ def run_env_mode(args: argparse.Namespace) -> int:
                 symbol,
                 tf,
                 str(snap.t0),
-                f"{snap.p0:.6f}",
+                f"{snap.p0:.6f}", # Breakout Line Start (Trend Line)
                 str(snap.t1),
-                f"{snap.p1:.6f}",
+                f"{snap.p1:.6f}", # Breakout Line End
                 str(snap.trend_dir),
                 f"{snap.line_now:.6f}",
                 f"{snap.last_close:.6f}",
                 breakout_long,
                 breakout_short,
                 breakout_line,
-                f"{snap.ch_p0:.6f}", # チャネルライン始点
-                f"{snap.ch_p1:.6f}", # チャネルライン終点
+                f"{snap.top_p0:.6f}", # Top Channel Start
+                f"{snap.top_p1:.6f}", # Top Channel End
+                f"{snap.btm_p0:.6f}", # Bottom Channel Start
+                f"{snap.btm_p1:.6f}", # Bottom Channel End
             ])
 
         if args.out_orders and h4:
@@ -444,7 +474,7 @@ def run_env_mode(args: argparse.Namespace) -> int:
                 "symbol", "tf", "t1", "p1", "t2", "p2",
                 "trend_dir", "line_now", "last_close",
                 "breakout_long", "breakout_short", "breakout_line",
-                "ch_p1", "ch_p2",
+                "top_p0", "top_p1", "btm_p0", "btm_p1" # Header Updated
             ])
             writer.writerows(line_rows)
     if args.out_orders:
