@@ -1,100 +1,31 @@
 #!/usr/bin/env python3
-"""Compute a linear-regression trendline or environment/trade state from OHLC CSV data."""
+"""OHLC CSVから回帰トレンドライン/環境/トレード状態を計算する.
+
+メモ:
+- トレンドラインの主要ロジックは common.py (assess_timeframe, breakouts, swings) に集約。
+- このスクリプトは入出力とオーケストレーション、シグナル出力に集中。
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
 from common import (
+    EnvSnapshot,
+    assess_timeframe,
     compute_regression,
     extract_series,
-    linear_regression,
+    find_last_breakout,
+    find_swings,
+    line_at,
     load_ohlc_rows,
-    median,
     parse_rows,
     pip_size_for_symbol,
 )
-
-@dataclass
-class EnvSnapshot:
-    trend_dir: int
-    slope: float
-    line_now: float
-    last_close: float
-    t0: int
-    t1: int
-    # 7本ライン生成用：チャネル全体の「上限」と「下限」の座標
-    top_p0: float
-    top_p1: float
-    btm_p0: float
-    btm_p1: float
-    # ブレイクアウト判定用の基準ライン（Trend Line）
-    p0: float
-    p1: float
-
-
-@dataclass
-class SwingPoint:
-    index: int
-    time: int
-    price: float
-
-
-@dataclass
-class BreakoutInfo:
-    index: int
-    time: int
-    direction: int
-
-
-def line_at(snapshot: EnvSnapshot, t: int) -> float:
-    # ブレイクアウト判定には p0, p1 (トレンド側のライン) を使用
-    return snapshot.p0 + snapshot.slope * float(t - snapshot.t0)
-
-
-def find_swings(
-    rows: List[Tuple[int, float, float, float, float]], depth: int
-) -> Tuple[List[SwingPoint], List[SwingPoint]]:
-    highs: List[SwingPoint] = []
-    lows: List[SwingPoint] = []
-    if depth < 1 or len(rows) < (2 * depth + 1):
-        return highs, lows
-    for i in range(depth, len(rows) - depth):
-        _t, _o, h, l, _c = rows[i]
-        window_highs = [rows[j][2] for j in range(i - depth, i + depth + 1)]
-        window_lows = [rows[j][3] for j in range(i - depth, i + depth + 1)]
-        if h == max(window_highs):
-            highs.append(SwingPoint(index=i, time=rows[i][0], price=h))
-        if l == min(window_lows):
-            lows.append(SwingPoint(index=i, time=rows[i][0], price=l))
-    return highs, lows
-
-
-def find_last_breakout(
-    times: List[int],
-    closes: List[float],
-    snapshot: EnvSnapshot,
-    buffer_price: float,
-) -> BreakoutInfo | None:
-    if snapshot.trend_dir == 0:
-        return None
-    for i in range(len(times) - 1, 0, -1):
-        line_i = line_at(snapshot, times[i])
-        line_prev = line_at(snapshot, times[i - 1])
-        if snapshot.trend_dir < 0:
-            # 下降トレンド：上限ライン(Resistance)を上に抜けたらブレイク
-            if closes[i] > line_i + buffer_price and closes[i - 1] <= line_prev + buffer_price:
-                return BreakoutInfo(index=i, time=times[i], direction=1)
-        elif snapshot.trend_dir > 0:
-            # 上昇トレンド：下限ライン(Support)を下に抜けたらブレイク
-            if closes[i] < line_i - buffer_price and closes[i - 1] >= line_prev - buffer_price:
-                return BreakoutInfo(index=i, time=times[i], direction=-1)
-    return None
 
 
 def compute_trade_signal(
@@ -109,6 +40,7 @@ def compute_trade_signal(
     max_retrace_bars: int,
     swing_depth: int,
 ) -> dict | None:
+    """H4ブレイクアウトと上位足フィルタからシグナルを作る."""
     if not rows_h4 or snap_h4.trend_dir == 0:
         return None
     times, _highs, _lows, closes = extract_series(rows_h4)
@@ -138,6 +70,7 @@ def compute_trade_signal(
     if snap_mn and snap_mn.trend_dir == 1 and breakout.direction < 0:
         return None
 
+    # メモ: スイングポイントはブレイク後のリトレース基準点。
     highs, lows = find_swings(rows_h4, swing_depth)
     start = None
     if breakout.direction > 0:
@@ -171,6 +104,7 @@ def compute_trade_signal(
     if wave_size <= 0:
         return None
 
+    # メモ: ブレイクからの経過本数に応じてリトレースレベルを切替。
     bars_since_breakout = (len(rows_h4) - 1) - breakout.index
     if bars_since_breakout > max_retrace_bars:
         return None
@@ -206,117 +140,8 @@ def compute_trade_signal(
     }
 
 
-def assess_timeframe(rows: List[Tuple[int, float, float, float, float]], lookback: int,
-                     min_slope_pips: float, pip_size: float) -> EnvSnapshot | None:
-    if not rows:
-        return None
-    if lookback > 0 and len(rows) > lookback:
-        rows = rows[-lookback:]
-    times, highs, lows, closes = extract_series(rows)
-    if len(times) < 2:
-        return None
-    t0 = int(times[0])
-    t1 = int(times[-1])
-    xs = [t - t0 for t in times]
-    slope_high, intercept_high = linear_regression(xs, highs)
-    slope_low, intercept_low = linear_regression(xs, lows)
-    
-    diffs = [times[i] - times[i - 1] for i in range(1, len(times))]
-    bar_sec = median(diffs)
-    min_slope = 0.0
-    if min_slope_pips > 0 and bar_sec > 0:
-        min_slope = (min_slope_pips * pip_size) / float(bar_sec)
-    
-    trend_dir = 0
-    if slope_high > min_slope and slope_low > min_slope:
-        trend_dir = 1
-    elif slope_high < -min_slope and slope_low < -min_slope:
-        trend_dir = -1
-    
-    # ----------------------------------------------------------------
-    # 7本ライン（チャネル）の計算ロジック
-    # 1. トレンド方向に基づいて「基準となる傾き」を決める
-    # 2. その傾きを使って、期間内の全高値・全安値をスキャンし、
-    #    全てを包み込む「最大切片(Top)」と「最小切片(Bottom)」を算出する
-    # ----------------------------------------------------------------
-    slope = 0.0
-    
-    if trend_dir > 0:
-        # 上昇トレンド：安値の傾きを基準にする（サポート重視）
-        slope = slope_low
-    elif trend_dir < 0:
-        # 下降トレンド：高値の傾きを基準にする（レジスタンス重視）
-        slope = slope_high
-    else:
-        # レンジ：平均傾き
-        slope = (slope_high + slope_low) / 2.0
-
-    # 切片のスキャン (y = mx + c  =>  c = y - mx)
-    # 期間内のすべての足において、基準の傾き線を引いた場合の切片を計算し、最大値・最小値を得る
-    c_max = -1e20
-    c_min = 1e20
-    
-    for i in range(len(times)):
-        x_i = float(times[i] - t0)
-        # 高値に対する切片
-        c_h = highs[i] - slope * x_i
-        # 安値に対する切片
-        c_l = lows[i] - slope * x_i
-        
-        if c_h > c_max:
-            c_max = c_h
-        if c_l < c_min:
-            c_min = c_l
-    
-    # Top Line (チャネル上限)
-    top_p0 = c_max
-    top_p1 = c_max + slope * float(t1 - t0)
-    
-    # Bottom Line (チャネル下限)
-    btm_p0 = c_min
-    btm_p1 = c_min + slope * float(t1 - t0)
-
-    # ----------------------------------------------------------------
-    # ブレイクアウト判定用の「トレンドライン」の定義
-    # 上昇トレンドなら下限線、下降トレンドなら上限線をブレイク基準とする
-    # ----------------------------------------------------------------
-    p0 = 0.0
-    p1 = 0.0
-    
-    if trend_dir > 0:
-        # 上昇：下限ブレイクを監視
-        p0 = btm_p0
-        p1 = btm_p1
-    elif trend_dir < 0:
-        # 下降：上限ブレイクを監視
-        p0 = top_p0
-        p1 = top_p1
-    else:
-        # レンジ：中間にしておく（判定には使われない）
-        p0 = (top_p0 + btm_p0) / 2.0
-        p1 = (top_p1 + btm_p1) / 2.0
-    
-    t_last = times[-1]
-    # トレンドライン上の現在価格（ブレイク判定用）
-    line_now = p0 + slope * float(t_last - t0)
-
-    return EnvSnapshot(
-        trend_dir=trend_dir,
-        slope=slope,
-        line_now=line_now,
-        last_close=closes[-1],
-        t0=t0,
-        t1=t1,
-        p0=p0, # ブレイクアウト判定用（Trend Line）始点
-        p1=p1, # ブレイクアウト判定用（Trend Line）終点
-        top_p0=top_p0, # チャネル全体の上限始点
-        top_p1=top_p1, # チャネル全体の上限終点
-        btm_p0=btm_p0, # チャネル全体の下限始点
-        btm_p1=btm_p1  # チャネル全体の下限終点
-    )
-
-
 def run_env_mode(args: argparse.Namespace) -> int:
+    """環境/トレンドラインCSVを生成する(注文出力は任意)."""
     if not args.env_dir or not args.symbols:
         print("env mode requires --env-dir and --symbols", file=sys.stderr)
         return 2
@@ -402,7 +227,7 @@ def run_env_mode(args: argparse.Namespace) -> int:
             bo_price = ""
             bo_dir = "0"
             
-            # 波の終点（Wave End）用の変数
+            # メモ: wave end はブレイク後の高値/安値の到達点。
             we_time = ""
             we_price = ""
             
@@ -553,6 +378,7 @@ def run_env_mode(args: argparse.Namespace) -> int:
 
 
 def run_regression_mode(args: argparse.Namespace) -> int:
+    """単一CSVの回帰ラインを算出する."""
     times, prices = parse_rows(args.input)
     if not times:
         print("no data", file=sys.stderr)
@@ -584,6 +410,7 @@ def run_regression_mode(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    """CLIエントリポイント."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", help="CSV with columns: time,open,high,low,close")
     parser.add_argument("--output", help="Output CSV path (t1,p1,t2,p2,slope,intercept,n)")
