@@ -4,8 +4,11 @@ services:
     working_dir: /app
     volumes:
       - ./:/app
-      - ./data:/data
+      # ホスト(Mac)のパス : コンテナ内のパス
+      # 提示されたパスを使用していますが、ファイルが生成されない場合は後述の「パスの確認」を参照してください
+      - ${MT5_COMMON_FILES}:/app/mt5_data
     entrypoint: ["bash", "-lc"]
+    # コンテナを起動し続けるための設定
     command: ["sleep infinity"]
     environment:
       PYTHONUNBUFFERED: "1"
